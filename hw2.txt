@@ -1,0 +1,220 @@
+		 CSE-506 (Spring 2013) Homework Assignment #2
+		  (100 points, 18% of your overall grade)
+			    Version 2 (3/30/2013)
+		       Due Sunday 4/7/2013 @ 11:59pm
+
+
+* PURPOSE:
+
+To become familiar with the VFS layer of Linux, and especially with
+extensible file systems APIs.  To build a useful file system using stacking
+technologies.
+
+You will use the "wrapfs" stackable file system as a starting point for this
+assignment.  You will modify wrapfs to add integrity support for files,
+directories, and possibly more.
+
+You must work on HW2 *alone*.  No teams allowed!
+
+* RESOURCES
+
+For this assignment, the following resources would be handy.  Study them
+well.
+
+(a) The Linux kernel source code, obviously.  Pay special attention to the
+    Documentation/ subdirectory, esp. files related to locking,
+    filesystems/*.txt, vfs.txt, and others.  There's a lot of good stuff
+    there, which you'd have to find and read carefully.
+
+(b) The Wrapfs kernel sources in the hw2-USER git repository that each of
+    you have.  Note also the file Documentation/filesystems/wrapfs.txt.
+    This Wrapfs file system is under 2000 LoC, and hence is easier to study
+    in its entirety.
+
+(c) Assorted papers related to stackable file systems which were published
+    here:
+
+	http://www.fsl.cs.sunysb.edu/project-fist.html
+
+    Especially useful would be the following:
+
+	"I3FS: An In-Kernel Integrity Checker and Intrusion Detection File System"
+	"A Stackable File System Interface for Linux"
+	"Extending File Systems Using Stackable Templates"
+	"FiST: A Language for Stackable File Systems"
+	"On Incremental File System Development"
+
+(d) Browsable GIT-Web sources here, especially wrapfs-3.2.y:
+
+	http://git.fsl.cs.sunysb.edu/
+
+* TASK 1: INTEGRITY FOR FILES
+
+Implement Extended Attributes (EA or xattr) support for wrapfs.  You may
+inspect the Unionfs sources on git.fsl to see how it was done there.  Test
+using user-land tools to ensure that users can add/del/change/list EAs.  Be
+sure that EAs work only on top of lower file systems that support EAs
+natively (e.g., ext3).
+
+Next, support the following two EAs: has_integrity and integrity_val.
+
+1. has_integrity
+
+Possible values: 0 or 1.  0 means the file doesn't have integrity.  1 means
+that it does.  If this EA doesn't exist for a file, the file shouldn't have
+a checksum.
+
+Only root users can set, change, or remove has_integrity (using user-land
+tools).  Non-root users can query its value but not change/remove it, to
+ensure security.  If has_integrity is removed, the integrity_val should be
+removed as well.  You should intercept EA ops in wrapfs and act upon them
+accordingly.
+
+2. integrity_val
+
+Possible values: an actual MD5 checksum for the entire file.  A value should
+only exist if has_integrity is 1.  This value can only be read by users
+(root and non-root) but no super/user should modify it.  Only the kernel
+should update this value automatically (when has_integrity gets set).
+
+When a file is opened in wrapfs, validate its integrity.  Any error should
+result in returning EPERM and logging an appropriate printk message.
+
+A file's data could be updated by reads/writes after being opened, but the
+integrity won't get updated until the file is closed.  When the file is
+closed, recalculate the integrity and update it in this EA.
+
+You will need to keep in-ram state to know whether a file has had
+modifications to its data such that its integrity is stale.  This is
+useful for two reasons:
+
+(a) to avoid updating the checksum for files that have been opened then
+closed right away, or opened and only read but not written.
+
+(b) to handle the situation when another process B opens the same file that
+got modified by a separate process A.  Here, if you compare the integrity, it
+won't match because process A changed the file but didn't update the
+integrity yet.  In this case, you'd have to recalculate the integrity and update
+it in the on-disk file, to avoid a false negative error when process B opens
+the file.
+
+You should carefully think about what to do in the case of creating new
+files, truncating them, and any other op that affects this.  Integrity
+should only apply to regular files.
+
+In cases where one of the two mentioned attributes does not exist should be
+handled appropriately.
+
+* TASK 2: INTEGRITY FOR DIRECTORIES
+
+Next, support only the has_integrity EA for directory inodes.  Here, the
+directories themselves would NOT have integrity verified directly.  Rather,
+if a directory has the has_integrity set to 1, then all NEW files being
+created in that directory should inherit the has_integrity=1 field.  This
+is useful to mark a top-level directory as has_integrity, and automatically
+get all files/dirs below it to inherit this flag.
+
+* TESTING
+
+Testing a file system is very important.  Users expect file systems to be
+very reliable (unlike networks).  During initial debugging, you should run
+simple tests on your own to verify that your code is working well.  But
+eventually, you are expected to run a full POSIX-compliance testing suite on
+your code to check for problems and especially races.  You will use the
+Linux Testing Project (LTP) test suite for this assignment.  First, run the
+testing suite on Ext3 to check what it reports (some tests fail to pass
+because Ext3 doesn't implement certain advanced features).  Then you should
+test LTP on top of unmodified Wrapfs to see how it behaves: it should not
+report any more failed tests when wrapfs is stacked on top if Ext3, nor
+should it succeed where Ext3 failed.  Then test LTP on your modified Wrapfs.
+In each case, you shouldn't see obvious failures to pass tests, oopses, or
+unexpected deviation from the set of tests which pass on Ext3, etc.
+
+For your convenience, we've provided you with a pre-compiled version of the
+Linux Testing Project (LTP) package here:
+
+	http://www.cs.sunysb.edu/~ezk/cse506-s13/hw2-tests.tar.gz
+
+You should download it into your VM:
+
+# cd /usr/src
+# wget http://www.cs.sunysb.edu/~ezk/cse506-s13/hw2-tests.tar.gz
+# tar xzvf hw2-tests.tar.gz
+
+Next, follow the instructions in /usr/src/hw2-tests/README, to prepare the
+regression testing for use in this assignment.
+
+* COMMON GUIDELINES
+
+Use 3.2.y, the kernel that's in the hw2 git repository each of you has.
+Just as in HW1, each of you has a "hw2-<USER>" GIT repository that you can
+clone for this assignment.  To make life easier, you can use the following
+kernel config file uniformly to build a working kernel in your VM:
+
+	http://www.cs.sunysb.edu/~ezk/cse506-s13/vmware.config
+
+Document your code carefully.  Commit a README.HW2 file at the top of your
+git tree, which describes what you did.  The README should also discuss the
+pros and cons (advantages, limitations) of your chosen techniques and
+design.  I expect quality code akin to what the rest of the kernel has.
+
+In HW2 I give you less details of the assignment.  Once you begin
+investigating, designing, and even coding, you may come across issues that
+are not mentioned in this hw2.txt document.  In that case, you have to
+decide how to resolve the issue on your own, and document/defend your
+choices, taking into performance, usability, security, maintainability, etc.
+This is done on purpose for several reasons: to prepare you for the class
+project (HW3) where you'll have a lot of freedom; to prepare you for doing
+independent research in your future studies; and to prepare you for the
+workforce after your graduation.
+
+* SUBMISSION
+
+Simply git-commit and git-push your changes to your cloned git repository; a
+successful git-push will result in an email going to you, confirming the
+commit and push.  Don't forget to include the README.HW2 file.  If for some
+reason you decided to add other file(s) to your GIT repository, please
+mention this in README.HW2 so we don't miss it during grading (and justify
+why a new file was needed).
+
+Also note that we will just do a git clone of your final repository and run
+make, make modules_install, and make install as usual.  You must not assume
+that we will do ANY modification in your code.  Your code MUST compile and
+run as it is.  You will lose all points in submission section IF your code
+doesn't compile/run as checked out.
+
+If you attempt any EXTRA CREDIT functionality, your README MUST specify
+exactly how to compile your code with extra credit enabled.  By default,
+your code MUST NOT compile extra credit code.
+
+* EXTRA CREDIT (OPTIONAL)
+
+If you do any of the extra credit work, then your EC code must be wrapped
+with an appropriate ifdef:
+
+	#ifdef EXTRA_CREDIT
+		// EC code here
+	#else
+		// base assignment code here
+	#endif
+
+This is in addition to any #ifdef's needed for the main part of the
+assignment.
+
+A. [10 pts] multiple checksum algorithms support
+
+Add a third EA called "integrity_type" whose name can be "md5," "sha1," and
+any acceptable digest algorithms supported by CryptoAPI.  If not specified,
+then default to MD5.  if a root user sets this EA, only accept known
+checksumming algorithms; otherwise return an error.  If a root user changes
+or sets this EA, you have to recalculate the checksum for the file in question.
+
+B. [5 pts] symlinks
+
+Support integrity checking for symlink values (i.e., the data path a
+symlink points to).
+
+* ChangeLog: a list of changes that this description had
+
+v1: original version
+v2: clarify LTP testing

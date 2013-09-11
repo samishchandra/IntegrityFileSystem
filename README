@@ -1,0 +1,267 @@
+
+ --------------------------
+| Logic and Implementation |
+ --------------------------
+
+Our primary goal is maintain integrity of the file system. This can be achieved using stackable file system. The template wrapfs code which is used to stack a filesystem on top of any other file system acts like a transparent layer between vfs layer and actual file system layer. It basially intercepts the operations and perform certain addition tasks like implementing integrity checking, encryption etc.
+
+The integrity checking is implemented by making use of extended attributes support. We store and retrieve the hash values in ex-attributes (xattr). For development purposes wrapfs is mounted on top of ext3 file-system.
+
+Setting, Getting, Removing, Listing extended attributes are implemented in xattr.c and are registered in inode.c as directory & file ops. These functions are required for supporting xattr in wrapfs.
+
+
+For integrity checking we reserved 3 ex-attributes
+
+	1. has_integrity
+	2. integrity_val
+	3. integrity_type
+
+has_integrity is a boolean attributes and serves two purposes. First it tells whether a file has integrity or not. Second whether integrity of the file has be updated or not. This value is inherited from the parent directory if it set for the parent directory.
+
+integrity_val stores the crypto hash computed using some crypto hash algorithm. If has_integrity=0 for a file then this xattr doesn't exist. This value gets updated on file release operation i.e. when the file's reference count is 0.
+
+integrity_type is a string attribute and stores which crypto algo is used to compute the integrity value of a file. If the file is modified then new crypto hash is computed based on specified integrity_type.
+
+Only root users can set/unset the has_integrity flag and only root users can set/remove integrity_type. Any user either root/normal cannot modify/remove the xattr integrity_val directly. Users are allowed to view the value of any of these attributes.
+
+Typical flow of system is as follows
+
+	1. root user creates a file
+	2. during the creation time, has_integrity is inherited from parent directory if it has one. It can also be set by the root user.
+	3. if has_integrity is set then the crypto hash is computed using the default 'md5' check sum algorithm and stored against integrity_val. If integrity_type holds any other algo then crypto hash is computed using the specified algo.
+	4. if a root/normal user opens the file, then integrity checking is done, if has_integrity=1 for the file. If the integrity check fails then report error or else go ahead with opening the file
+	5. if any no of bytes are written to the file then set a in-ram dirty bit for the inode
+	6. integrity_val is computed if the dirty bit is 1 during file release operation
+	7. for symlinks the crypto hash is computed/checked for the path string that it is pointing to
+
+To maintain consistency in the system, we make sure that integrity_val always exists when has_integrity=1 and integrity_val doesn't exist when has_integrity=0. For this purpose only we compute the integrit_val and store it when the root user just sets the has_integrity=1 for a file.
+
+If we maintain in ram-state variable (dirty_flag), we set it if any data has been written to the inode. If process_1 is writing to a file and still haven’t closed the file, we would have already set the dirty_flag variable, and if another process process_2 tries to read the same file then it checks for the dirty_flag. If the dirty_flag is not set then it checks for the integrity. If the dirty_flag is set then we have the following options.
+
+option 1: process_2 goes ahead with opening the file since the dirty_flag is 1
+option 2: process_2 computes and stores the integrity, unsets the dirty_flag and goes ahead with opening the file
+
+Hence process_2 checks against the dirty bit, if it set then file is opened with provided flags, since it identified that another process is writing to the file.
+	
+Here the process_2 can also compute the integrity of the file and save it to disk and reset the dirty bit. Buf this strategy is not suitable when more number of processes try to access the same file then they all have to compute the integrity_val when they see the dirty bit as 1 (I intentionally commented out this code line# 79-84 in file.c). Instead we can go ahead with opening the file. Upudating integrity_val is left to the original process which is writing to the file.
+
+
+Wrapfs inode's private data is used to store the dirty flag. Since this inode is not flushed to disk, this is not persistent and we dont want it to be persistent. The dirty flag maintains the in-ram state of a inode's integrity.
+
+
+ --------------
+| Source files |
+ -------------- 
+wrapfs directory, contains implementation of stackable file system that performs integrity checking. The code is developed using the blank wrapfs template.
+
+wrapfs source files are taken from http://lxr.fsl.cs.sunysb.edu/linux/source/fs/wrapfs/
+
+Modifications in existing files
+===============================
+
+inode.c
+-------
+	- functions registration for files ops, dir ops and symlink ops
+	
+	- wrapfs_create
+		- integrity is copied from parent directory if it has one
+		- if copied has_integrity=1 then crypto hash is computed and stored in integrity_val xattr
+	
+	- wrapfs_mkdir
+		- integrity is copied from parent directory if it has one, but here we dont need to compute the integrity_val for directory
+	
+	- wrapfs_symlink
+		- integrity is copied from parent directory if it has one
+		- if copied has_integrity=1 then hash value is computed on the stored path and stored in integrity_val xattr
+	
+	- wrapfs_readlink
+		- checks if is has_integrity exists
+		- if has_integrity=1 then integrity checking is done to ensure follow_link is valid
+
+file.c
+------
+	- wrapfs_open
+		- check if the file system supports extended attributes, if support is not there then no integrity checking code will run
+		- check if has_integrity is present, if has_integrity=1 then perform integrity checking
+	
+	- wrapfs_release
+		- if dirty flag is set and the file is opened in write mode then compute integrity and update the value which gets saved to disk
+	
+	- wrapfs_write
+		- if bytes are written to inode then set the dirty flag of wrapfs inode, this dirty flag gets stored in memory. Hence can be used to check whether a file's integrity is valid or not. If a file is opened and closed we needn't compute the integrity again no data is written to it.
+
+wrapfs.h
+--------
+	- dirty_flag is added to wrapfs_inode_info structure to support in-ram state of the inode
+	- helpful functions to compute crypto hash integrity are extern'ed
+	- necessary header files are imported
+
+
+New source files
+================
+
+xattr.c
+-------
+Contains functions that support extended attributes
+
+	- getxattr
+		- find the corresponding lower dentry to wrapfs dentry and make a call to vfs_getxattr, justs act like a transparent layer
+	
+	- setxattr
+		- check whether the function arguments are valid
+		- check whether the xattr being set is integrity_val, if yes deny the permission
+		- check whether the xattr being set is has_integrity, if yes deny the permission for normal users. The operation has to permitted only for root users
+		- vfs_setxattr is called with corresponding lower dentry object and with proper locks
+		- if xattr has_integrity is being set to 1 then compute the crypto hash and store it again integrity_val xattr
+		- if xattr has_integrity is being set to 0 then remove the xattr integrity_val
+		- checks are put so that the operations are not run incase of directories
+		- if integrity_type is being set and has_integrity value is 1 then recompute the crypto hash using new algo and store the value against integrity_val xattr
+	
+	- removexattr
+		- function arguments are validated
+		- vfs_removexattr is called with corresponding lower dentry object and with proper locks
+		- if has_integrity is being removed then we also remove the corresponding integrity_val and integrity_type
+		- if integrity_type is removed and has_integrity xattr is 1 for the inode, then the crypto hash is recomputed using the default 'md5' checksum algorithm
+
+	-listxattr
+		- find the corresponding lower dentry to wrapfs dentry and make a call to vfs_listxattr, just acts like a transparent layer
+
+integrity.c
+-----------
+
+	- int has_integrity(struct path lower_path)
+
+		returns the value stored against xattr has_integrity. If the value is not 0 or 1 then it returns EPERM error
+
+	- long get_integrity(struct path lower_path, unsigned char *ibuf, unsigned int ilen)
+
+		fetches the xattr value stored again integrity_val and copies to passed ibuf
+
+	- long set_has_integrity(struct path lower_path, unsigned char buf)
+
+		sets the has_integrity for a file and if the setting value is 1 then crypto hash gets computed and stored against integrity_vxattr 
+
+	- long set_integrity_val(stuct path lower_path)
+		- allocates memory for buffers
+		- computes the integrity_val and stores it in the xattr
+		- to support dynamic crypto algorithms integrity_type is fetched and crypto hash is computed using the save algo
+
+	- long compute_integrity(struct path lower_path, unsigned char *ibuf, unsigned int ilen, 
+	unsigned int flag, const char *algo)
+		- core function to compute the integrty of the file
+		- Input: filename, buffer to store integrity value, size of integrity value, flag to tell whether to update the integrity value, algo to be used
+ 		- Output: return 0 if the all steps are successful; else return respective -ERRNO
+		- allocate for crypto transform
+		- initialize the crypto hash
+		- open the file using filp_open
+		- check if the read/write permissions exist
+		- allocate memory for temp buffer to store the chunks of the file
+		- read CHUNKSIZE bytes from the file and update the hash value
+		- finalize the hash value and write it to ibuf
+		- allocate memory to manufacture attribute name
+		- use vfs_setxattr to set the appropriate extended attribute value
+		- free the allocated memory accordingly
+	
+	- int check_integrity(struct path lower_path)
+		- helpful wrapper function to check whether the current file integrity is matching against the saved integirty value
+
+	- int calculate_integrity(char *dest, char *src, int len, const char *algo)
+		- function to compute the crpto hash using string src of len and using algo as crypto algo, the crypto hash is saved in the dest string
+		- this function is used to compute the crypto hash of the path in case of symlinks
+
+
+The code augumented in EXTRA_CREDIT, handles dynamic crypto algo and integrity checking for symlinks. Root user can specify the algo to be used for computing the integrity hash value by setting the value of integrity_type xattr.
+
+kernel.config
+-------------
+I tried to build kernel with minimum configuration. I have used http://www.linuxtopia.org/, http://www.kernel-seeds.org to configure the kernel. Based on the hardware present, I have included the drivers needed for them.
+
+I made sure that ext3, ext3 support, crypto hash, crypto hash algos are enabled in the kernel configurations.
+
+
+ ----------------
+| How to compile |
+ ----------------
+
+	cd /usr/src/hw2-skolli
+
+	1. make clean
+	2. make
+	3. make modules
+	4. make modules_install
+	5. make install
+
+	Once the hard drive is partitioned and formatted using fdisk, mkfs commands
+
+	6. rmmod wrapfs
+	7. insmod wrapfs.ko
+	6. mount -t ext3 /dev/hdb1 /n/scratch -o user_xattr
+	7. mount -t wrapfs /n/scratch /tmp -o user_xattr
+
+	cd /tmp
+
+
+ ---------------
+| Test the code |
+ ---------------
+
+testcases_file.sh
+-----------------
+contains test cases for adding, removing, listing, modifying the extended attributes of regular files
+
+testcases_dir.sh
+----------------
+contains test cases for adding, removing, listing, modifying the extended attributes of directories
+
+
+ ------------------
+| Error codes used |
+ ------------------
+
+	 (ERRNO 1) EPERM        : Operation not permitted when the integrity check failed
+	 (ERRNO 2) ENOENT       : File doesn't exist
+	(ERRNO 12) ENOMEM       : Unable to allocate memory in kernel for a variable
+	(ERRNO 13) EACCES       : Permission denied if the authenticaion fails
+	(ERRNO 14) EFAULT       : Cannot access the user arguments
+	(ERRNO 22) EINVAL       : Invalid values for the arguments given	
+	(ERRNO 36) ENAMETOOLONG : Name field in the arguments is too long
+	(ERRNO 61) ENODATA      : Integrity value doesn't exist for the file	
+	(ERRNO 95) EOPNOTSUPP   : Operation not supported
+
+
+ ------------
+| Test Cases |
+ ------------
+
+Task1:
+------
+ 1. basic testing adding xattr, modifying xattr, removing xattr, listing xattr to regular files
+ 2. setting has_integrity=0
+ 3. setting has_integrity=1 without existing integrity_val
+ 4. setting has_integrity=1 with existing integrity_val
+ 5. trying to xattr integrity_val for a file
+ 6. set integrity_type='md5', 'sha1', 'sha256'
+ 7. modify integrity_type
+ 8. remove has_integrity
+ 9. remove integrity_type
+10. open a file for writing and try to open the same file using another process
+11. tests targeting validation of arguments
+
+Task2:
+------
+ 1. basic testing adding xattr, modifying xattr, removing xattr, listing xattr to directories
+ 2. setting has_integrity=0 and creating a file/dir inside it
+ 3. setting has_integrity=1 and creating a file/dir inside it
+ 4. remove the has_integrity
+ 5. tests targeting validation of arguments
+
+
+ -----------
+| LTP Tests |
+ -----------
+
+LTP test suite is run on ext3 to check what it reports. It is then run wrapfs filesystem with unmodified downloaded wrapfs code. The tests didn't deviate from the previous test results. That is wrapfs haven't succeeded where ext3 failed or vice versa.
+
+After the developing the new wrapfs (with integrity checking) module. The new module is installed and again LTP test suite is run on wrapfs filesystem with new code. The test results stay intact.
+
+
